@@ -3,6 +3,7 @@
 Convert images to ANSI art (`.ans` files) using half-block characters and the 16-color CGA palette.
 
 ![Example: catte003.gif rendered as ANSI art](catte003.gif)
+*Cat artwork by Spiny of [Torment](https://www.spiny.org/torment/index.html)*
 
 ## How it works
 
