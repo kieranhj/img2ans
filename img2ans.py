@@ -15,6 +15,7 @@ Usage:
     python img2ans.py input.jpg -w 160           # 160-col wide
     python img2ans.py input.png -w 40 -t "Cool"  # 40-col with SAUCE title
     python img2ans.py input.png --full-block     # full blocks (stretched)
+    python img2ans.py input.png --gradient       # gradient shading (░▒▓)
 """
 
 import argparse
@@ -60,7 +61,14 @@ BG_CODES = {
 UPPER_HALF_BLOCK = 0xDF  # ▀ in CP437
 LOWER_HALF_BLOCK = 0xDC  # ▄ in CP437
 FULL_BLOCK = 0xDB        # █ in CP437
+LIGHT_SHADE = 0xB0       # ░ in CP437
+MEDIUM_SHADE = 0xB1      # ▒ in CP437
+DARK_SHADE = 0xB2        # ▓ in CP437
 SPACE = 0x20
+
+# Shade characters ordered by foreground coverage (0% → 100%)
+SHADE_CHARS = [SPACE, LIGHT_SHADE, MEDIUM_SHADE, DARK_SHADE, FULL_BLOCK]
+SHADE_WEIGHTS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])  # fg weight per shade
 
 
 def nearest_color(rgb):
@@ -103,6 +111,55 @@ def quantize_image(img, width, full_block=False):
     return indices
 
 
+def quantize_image_gradient(img, width, ice=True):
+    """Resize and quantize using gradient shading for higher color fidelity.
+
+    Uses shade characters (░▒▓) to blend between two CGA colors per cell,
+    giving 5 blend levels × 16×16 color pairs = effectively ~1280 tones.
+
+    Returns (fg_indices, bg_indices, shade_indices) each with shape (H, W).
+    """
+    orig_w, orig_h = img.size
+    cell_aspect = 8 / 16
+    pixel_height = int(round(width * (orig_h / orig_w) * cell_aspect))
+    if pixel_height < 1:
+        pixel_height = 1
+
+    img = img.convert("RGB").resize((width, pixel_height), Image.LANCZOS)
+    pixels = np.array(img, dtype=np.float64)
+
+    n_colors = 16
+    max_bg = n_colors if ice else 8
+    n_shades = len(SHADE_WEIGHTS)
+
+    # Precompute effective RGB for every (fg, bg, shade) combination
+    # Shape: (n_colors, max_bg, n_shades, 3)
+    fg_rgb = CGA_PALETTE[:n_colors]                          # (16, 3)
+    bg_rgb = CGA_PALETTE[:max_bg]                            # (max_bg, 3)
+    # outer products with shade weights
+    # effective = w * fg + (1-w) * bg
+    effective = (SHADE_WEIGHTS[np.newaxis, np.newaxis, :, np.newaxis]
+                 * fg_rgb[:, np.newaxis, np.newaxis, :]
+                 + (1 - SHADE_WEIGHTS)[np.newaxis, np.newaxis, :, np.newaxis]
+                 * bg_rgb[np.newaxis, :, np.newaxis, :])
+    # Flatten to (N, 3) for distance computation
+    n_combos = n_colors * max_bg * n_shades
+    effective_flat = effective.reshape(n_combos, 3)
+
+    # For each pixel find the nearest combo
+    # pixels: (H, W, 3), effective_flat: (N, 3)
+    diffs = pixels[:, :, np.newaxis, :] - effective_flat[np.newaxis, np.newaxis, :, :]
+    dists = np.sum(diffs ** 2, axis=3)
+    best = np.argmin(dists, axis=2)
+
+    # Decode flat index back to (fg, bg, shade)
+    fg_indices = (best // (max_bg * n_shades)).astype(np.uint8)
+    bg_indices = ((best // n_shades) % max_bg).astype(np.uint8)
+    shade_indices = (best % n_shades).astype(np.uint8)
+
+    return fg_indices, bg_indices, shade_indices
+
+
 def _pick_cell(top, bot, ice):
     """Choose character, foreground, and background for a cell pair.
 
@@ -133,6 +190,65 @@ def _pick_cell(top, bot, ice):
         return LOWER_HALF_BLOCK, bot, top
     # Both bright — demote the less-visible one (bottom) to its dark variant
     return UPPER_HALF_BLOCK, top, bot % 8
+
+
+def _render_gradient(fg_indices, bg_indices, shade_indices, width, ice=True):
+    """Render gradient-shaded cells using shade characters with fg+bg colors."""
+    height = fg_indices.shape[0]
+    buf = bytearray()
+    cur_fg = -1
+    cur_bg = -1
+    cur_bold = False
+    cur_blink = False
+
+    for row in range(height):
+        for col in range(width):
+            need_fg = int(fg_indices[row, col])
+            need_bg = int(bg_indices[row, col])
+            shade = int(shade_indices[row, col])
+            char = SHADE_CHARS[shade]
+
+            parts = []
+            want_bold = need_fg >= 8 if char != SPACE else cur_bold
+            want_blink = need_bg >= 8  # only reachable when ice=True
+
+            need_reset = (cur_bold and not want_bold) or (cur_blink and not want_blink)
+
+            if need_reset:
+                parts.append("0")
+                cur_fg = -1
+                cur_bg = -1
+                cur_bold = False
+                cur_blink = False
+
+            if want_bold and not cur_bold:
+                parts.append("1")
+                cur_bold = True
+            if want_blink and not cur_blink:
+                parts.append("5")
+                cur_blink = True
+
+            fg_base = need_fg % 8
+            fg_sgr = str(30 + [0, 4, 2, 6, 1, 5, 3, 7][fg_base])
+            if char != SPACE and (need_fg != cur_fg or need_reset):
+                parts.append(fg_sgr)
+                cur_fg = need_fg
+
+            bg_base = need_bg % 8
+            bg_sgr = str(40 + [0, 4, 2, 6, 1, 5, 3, 7][bg_base])
+            if need_bg != cur_bg or need_reset:
+                parts.append(bg_sgr)
+                cur_bg = need_bg
+
+            if parts:
+                buf.extend(b"\x1b[" + ";".join(parts).encode("ascii") + b"m")
+
+            buf.append(char)
+
+        if width != 80:
+            buf.extend(b"\r\n")
+
+    return bytes(buf)
 
 
 def _render_full_block(indices, width):
@@ -296,14 +412,61 @@ def render_preview(indices, scale=8, full_block=False):
     return img
 
 
+def render_preview_gradient(fg_indices, bg_indices, shade_indices, scale=8):
+    """Render a gradient-shaded pixel grid to an RGB preview image.
+
+    Each character cell is rendered at *scale* × *scale*×2 pixels with a
+    stipple pattern that matches the shade character:
+      - space  → all background
+      - ░      → 25% foreground (sparse dots)
+      - ▒      → 50% foreground (checkerboard)
+      - ▓      → 75% foreground (dense dots)
+      - █      → all foreground
+    """
+    palette_u8 = CGA_PALETTE.astype(np.uint8)
+    h, w = fg_indices.shape
+    cw = scale          # cell width in preview pixels
+    ch = scale * 2      # cell height (2:1 aspect for full-height chars)
+
+    # Build per-pixel stipple masks for each shade level within one cell
+    # yx grid within a cell
+    cy, cx = np.mgrid[0:ch, 0:cw]
+    shade_masks = np.zeros((5, ch, cw), dtype=bool)
+    # shade 0 (space):   all False  → all bg
+    # shade 1 (░ 25%):   every other pixel in every other row
+    shade_masks[1] = (cy % 2 == 0) & (cx % 2 == 0)
+    # shade 2 (▒ 50%):   checkerboard
+    shade_masks[2] = (cx + cy) % 2 == 0
+    # shade 3 (▓ 75%):   inverse of 25% pattern
+    shade_masks[3] = ~shade_masks[1]
+    # shade 4 (█ full):  all True → all fg
+    shade_masks[4] = True
+
+    out = np.zeros((h * ch, w * cw, 3), dtype=np.uint8)
+
+    for row in range(h):
+        for col in range(w):
+            fg = palette_u8[fg_indices[row, col]]
+            bg = palette_u8[bg_indices[row, col]]
+            mask = shade_masks[shade_indices[row, col]]  # (ch, cw)
+            cell = np.where(mask[:, :, np.newaxis], fg, bg)
+            out[row * ch:(row + 1) * ch, col * cw:(col + 1) * cw] = cell
+
+    return Image.fromarray(out)
+
+
 def convert(input_path, output=None, width=80, title="", author="", group="",
-            ice=True, preview=None, full_block=False):
+            ice=True, preview=None, full_block=False, gradient=False):
     img = Image.open(input_path)
 
-    indices = quantize_image(img, width, full_block=full_block)
-    rows = indices.shape[0] if full_block else indices.shape[0] // 2
-
-    art_data = render_ansi(indices, width, ice=ice, full_block=full_block)
+    if gradient:
+        fg_idx, bg_idx, shade_idx = quantize_image_gradient(img, width, ice=ice)
+        rows = fg_idx.shape[0]
+        art_data = _render_gradient(fg_idx, bg_idx, shade_idx, width, ice=ice)
+    else:
+        indices = quantize_image(img, width, full_block=full_block)
+        rows = indices.shape[0] if full_block else indices.shape[0] // 2
+        art_data = render_ansi(indices, width, ice=ice, full_block=full_block)
 
     # Build SAUCE
     sauce = make_sauce(title=title, author=author, group=group,
@@ -320,7 +483,10 @@ def convert(input_path, output=None, width=80, title="", author="", group="",
         sys.stdout.buffer.write(full)
 
     if preview:
-        preview_img = render_preview(indices, full_block=full_block)
+        if gradient:
+            preview_img = render_preview_gradient(fg_idx, bg_idx, shade_idx)
+        else:
+            preview_img = render_preview(indices, full_block=full_block)
         preview_img.save(preview)
         print(f"Preview saved to {preview}  ({preview_img.size[0]}x{preview_img.size[1]} px)",
               file=sys.stderr)
@@ -343,13 +509,18 @@ def main():
                         help="Use full block characters (one cell per pixel) "
                              "instead of half-blocks.  Output is vertically "
                              "stretched but avoids half-block rendering.")
+    parser.add_argument("--gradient", action="store_true",
+                        help="Use gradient shading with shade characters "
+                             "(░▒▓) to blend between CGA colors.  Gives "
+                             "much higher effective color fidelity at the "
+                             "cost of a stippled/dithered appearance.")
     parser.add_argument("-p", "--preview", metavar="FILE",
                         help="Save a PNG preview of the ANSI art")
     args = parser.parse_args()
 
     convert(args.input, args.output, args.width, args.title, args.author,
             args.group, ice=not args.no_ice, preview=args.preview,
-            full_block=args.full_block)
+            full_block=args.full_block, gradient=args.gradient)
 
 
 if __name__ == "__main__":
