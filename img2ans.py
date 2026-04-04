@@ -14,6 +14,7 @@ Usage:
     python img2ans.py input.gif -o out.ans       # write to file
     python img2ans.py input.jpg -w 160           # 160-col wide
     python img2ans.py input.png -w 40 -t "Cool"  # 40-col with SAUCE title
+    python img2ans.py input.png --full-block     # full blocks (stretched)
 """
 
 import argparse
@@ -69,20 +70,26 @@ def nearest_color(rgb):
     return int(np.argmin(dists))
 
 
-def quantize_image(img, width):
+def quantize_image(img, width, full_block=False):
     """Resize and quantize an image to the CGA palette.
 
     Returns a 2D array of palette indices with shape (height, width),
-    where height is even (padded if needed).
+    where height is even (padded if needed) in half-block mode, or
+    any value in full-block mode.
     """
     # Compute height preserving aspect ratio.  Each character cell is
     # roughly 8×16 px in a VGA font, so one cell = 2 vertical pixels
     # in half-block mode.  We correct for the 1:2 cell aspect ratio.
     orig_w, orig_h = img.size
     cell_aspect = 8 / 16  # width / height of a VGA character cell
-    pixel_height = int(round(width * (orig_h / orig_w) * cell_aspect)) * 2
-    if pixel_height < 2:
-        pixel_height = 2
+    if full_block:
+        pixel_height = int(round(width * (orig_h / orig_w) * cell_aspect))
+        if pixel_height < 1:
+            pixel_height = 1
+    else:
+        pixel_height = int(round(width * (orig_h / orig_w) * cell_aspect)) * 2
+        if pixel_height < 2:
+            pixel_height = 2
 
     img = img.convert("RGB").resize((width, pixel_height), Image.LANCZOS)
     pixels = np.array(img, dtype=np.float64)
@@ -128,11 +135,55 @@ def _pick_cell(top, bot, ice):
     return UPPER_HALF_BLOCK, top, bot % 8
 
 
-def render_ansi(indices, width, ice=True):
+def _render_full_block(indices, width):
+    """Render each pixel as a full-block character with foreground color only."""
+    height = indices.shape[0]
+    buf = bytearray()
+    cur_fg = -1
+    cur_bold = False
+
+    for row in range(height):
+        for col in range(width):
+            color = int(indices[row, col])
+            want_bold = color >= 8
+            parts = []
+
+            need_reset = cur_bold and not want_bold
+            if need_reset:
+                parts.append("0")
+                cur_fg = -1
+                cur_bold = False
+
+            if want_bold and not cur_bold:
+                parts.append("1")
+                cur_bold = True
+
+            if color != cur_fg or need_reset:
+                fg_base = color % 8
+                fg_sgr = str(30 + [0, 4, 2, 6, 1, 5, 3, 7][fg_base])
+                parts.append(fg_sgr)
+                cur_fg = color
+
+            if parts:
+                buf.extend(b"\x1b[" + ";".join(parts).encode("ascii") + b"m")
+
+            buf.append(FULL_BLOCK)
+
+        if width != 80:
+            buf.extend(b"\r\n")
+
+    return bytes(buf)
+
+
+def render_ansi(indices, width, ice=True, full_block=False):
     """Render a palette-index grid into raw ANSI bytes (CP437 + escape seqs).
 
-    Processes rows in pairs (top, bottom).  For each column the best
-    character + fg/bg combination is chosen:
+    When *full_block* is True, each pixel gets its own character cell using
+    a full-block character (█) with only foreground color.  This produces
+    vertically stretched output but avoids half-block rendering.
+
+    Otherwise, processes rows in pairs (top, bottom).  For each column the
+    best character + fg/bg combination is chosen:
       - Both same color  → space with that bg (or full-block with that fg)
       - Different colors → ▀ or ▄ half-block with appropriate fg/bg
 
@@ -145,6 +196,9 @@ def render_ansi(indices, width, ice=True):
     cur_bg = -1
     cur_bold = False
     cur_blink = False
+
+    if full_block:
+        return _render_full_block(indices, width)
 
     for row in range(0, height, 2):
         for col in range(width):
@@ -224,30 +278,32 @@ def make_sauce(title="", author="", group="", width=80, height=0, ice=True):
     return sauce
 
 
-def render_preview(indices, scale=8):
+def render_preview(indices, scale=8, full_block=False):
     """Render the quantized pixel grid to an RGB image.
 
     Each pixel in *indices* maps to a CGA palette color.  The image is
-    scaled uniformly by *scale* using nearest-neighbor interpolation.
-    The cell aspect ratio correction is already applied during
-    quantization, so no further adjustment is needed here.
+    scaled by *scale* using nearest-neighbor interpolation.  In half-block
+    mode the cell aspect ratio correction is already applied during
+    quantization.  In full-block mode each pixel occupies a full 8×16
+    character cell, so the vertical scale is doubled to match.
     """
     palette_u8 = CGA_PALETTE.astype(np.uint8)
     rgb = palette_u8[indices]  # (H, W, 3)
     img = Image.fromarray(rgb)
-    img = img.resize((indices.shape[1] * scale, indices.shape[0] * scale),
+    y_scale = scale * 2 if full_block else scale
+    img = img.resize((indices.shape[1] * scale, indices.shape[0] * y_scale),
                      Image.NEAREST)
     return img
 
 
 def convert(input_path, output=None, width=80, title="", author="", group="",
-            ice=True, preview=None):
+            ice=True, preview=None, full_block=False):
     img = Image.open(input_path)
 
-    indices = quantize_image(img, width)
-    rows = indices.shape[0] // 2  # character rows
+    indices = quantize_image(img, width, full_block=full_block)
+    rows = indices.shape[0] if full_block else indices.shape[0] // 2
 
-    art_data = render_ansi(indices, width, ice=ice)
+    art_data = render_ansi(indices, width, ice=ice, full_block=full_block)
 
     # Build SAUCE
     sauce = make_sauce(title=title, author=author, group=group,
@@ -264,7 +320,7 @@ def convert(input_path, output=None, width=80, title="", author="", group="",
         sys.stdout.buffer.write(full)
 
     if preview:
-        preview_img = render_preview(indices)
+        preview_img = render_preview(indices, full_block=full_block)
         preview_img.save(preview)
         print(f"Preview saved to {preview}  ({preview_img.size[0]}x{preview_img.size[1]} px)",
               file=sys.stderr)
@@ -283,12 +339,17 @@ def main():
     parser.add_argument("--no-ice", action="store_true",
                         help="Disable iCE colors (restrict backgrounds to dark "
                              "colors 0-7 to avoid flashing in legacy viewers)")
+    parser.add_argument("--full-block", action="store_true",
+                        help="Use full block characters (one cell per pixel) "
+                             "instead of half-blocks.  Output is vertically "
+                             "stretched but avoids half-block rendering.")
     parser.add_argument("-p", "--preview", metavar="FILE",
                         help="Save a PNG preview of the ANSI art")
     args = parser.parse_args()
 
     convert(args.input, args.output, args.width, args.title, args.author,
-            args.group, ice=not args.no_ice, preview=args.preview)
+            args.group, ice=not args.no_ice, preview=args.preview,
+            full_block=args.full_block)
 
 
 if __name__ == "__main__":
